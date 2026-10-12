@@ -9,6 +9,7 @@
  *   KP_TOKEN  — ключ poiskkino.dev
  *   TMDB_KEY  — ключ TMDB (v3 api_key или длинный "Read Access Token" v4)
  *   TMDB_LANG — язык TMDB, по умолчанию ru-RU
+ *   TMDB_API / TMDB_IMG — свои адреса API и картинок TMDB (если нужно зеркало/прокси)
  *   PORT      — порт при запуске через `node index.js` (по умолчанию 7000)
  */
 const http = require('http');
@@ -18,7 +19,10 @@ const KP_API = (process.env.KP_API || 'https://api.poiskkino.dev/v1.4').replace(
 const TMDB_KEY = (process.env.TMDB_KEY || '').trim();
 const TMDB_API = (process.env.TMDB_API || 'https://api.themoviedb.org/3').replace(/\/$/, '');
 const TMDB_LANG = process.env.TMDB_LANG || 'ru-RU';
+const TMDB_IMG = (process.env.TMDB_IMG || 'https://image.tmdb.org/t/p').replace(/\/$/, '');
 
+const VERSION = '2.1.0';
+const THUMBS = process.env.TM_THUMBS === '1'; // миниатюры серий (много лишних картинок), по умолчанию выключены
 const KP_PAGE = 50;
 const TM_PAGE = 20;
 const HOUR = 3600 * 1000;
@@ -29,14 +33,30 @@ const year = () => new Date().getFullYear();
 
 // ---------- Общие помощники ----------
 const cache = new Map();
-async function cached(key, ttl, fn) {
+async function cached(key, ttl, fn, shouldCache) {
   const hit = cache.get(key);
   if (hit && hit.exp > Date.now()) return hit.val;
   const val = await fn();
-  cache.set(key, { val, exp: Date.now() + ttl });
-  if (cache.size > 3000) cache.delete(cache.keys().next().value);
+  if (!shouldCache || shouldCache(val)) {
+    cache.set(key, { val, exp: Date.now() + ttl });
+    if (cache.size > 3000) cache.delete(cache.keys().next().value);
+  }
   return val;
 }
+// Ограничитель одновременных запросов, чтобы пачка запросов не забивала сервер и не упиралась в лимиты TMDB
+function limiter(max) {
+  let active = 0;
+  const queue = [];
+  const next = () => {
+    if (active >= max || !queue.length) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    fn().then(resolve, reject).finally(() => { active--; next(); });
+  };
+  return (fn) => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
+}
+const idsPool = limiter(10); // поиск IMDb-id для списков
+const imgPool = limiter(8);  // загрузка картинок
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null && v !== ''));
 const isoDate = (s) => { const t = Date.parse(s); return new Date(isNaN(t) ? 0 : t).toISOString(); };
 const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
@@ -160,7 +180,7 @@ async function kpCatalog(def, extra) {
     if (genre) params.push(['genres.name', genre]);
     const d = await kpList('/movie', params);
     return (d.docs || []).map((m) => kpPreview(m, def.type)).filter(Boolean);
-  });
+  }, (v) => v.length > 0);
 }
 
 async function kpMeta(type, imdb) {
@@ -278,30 +298,39 @@ async function tmdb(path, params = []) {
   const headers = { accept: 'application/json' };
   if (TMDB_KEY.length > 40) headers.Authorization = `Bearer ${TMDB_KEY}`; // токен v4
   else url.searchParams.set('api_key', TMDB_KEY);                          // ключ v3
-  const r = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
-  if (!r.ok) {
+  let last;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // сетевые ошибки и таймаут сразу уходят вверх, повторяем только 429 и 5xx
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(7000) });
+    if (r.ok) return r.json();
     const t = await r.text().catch(() => '');
-    throw new Error(`tmdb ${r.status}: ${t.slice(0, 200)}`);
+    last = new Error(`tmdb ${r.status}: ${t.slice(0, 200)}`);
+    if (r.status !== 429 && r.status < 500) throw last;
+    const ra = parseInt(r.headers && r.headers.get ? r.headers.get('retry-after') : '', 10);
+    await new Promise((ok) => setTimeout(ok, Math.min(2000, ra ? ra * 1000 : 400 * (attempt + 1))));
   }
-  return r.json();
+  throw last;
 }
 
 async function tmImdbId(kind, id) {
   try {
-    return await cached(`tmx:${kind}:${id}`, 30 * DAY, async () => {
+    const v = await cached(`tmx:${kind}:${id}`, 30 * DAY, () => idsPool(async () => {
       const d = await tmdb(`/${kind}/${id}/external_ids`);
       return /^tt\d+$/.test(d.imdb_id || '') ? d.imdb_id : '';
-    }) || null;
+    }));
+    return v || null;
   } catch (e) {
-    return null;
+    return undefined; // ошибка запроса (не путать с «у тайтла нет IMDb-id»)
   }
 }
 
 async function tmPreviews(results, type) {
   const kind = type === 'movie' ? 'movie' : 'tv';
+  let failed = 0;
   const items = await Promise.all((results || []).map(async (r) => {
     if (!r.poster_path) return null;
     const imdb = await tmImdbId(kind, r.id);
+    if (imdb === undefined) { failed++; return null; }
     const name = r.title || r.name || r.original_title || r.original_name;
     if (!imdb || !name) return null;
     return clean({
@@ -314,7 +343,9 @@ async function tmPreviews(results, type) {
       description: r.overview,
     });
   }));
-  return items.filter(Boolean);
+  const out = items.filter(Boolean);
+  if (failed) out.partial = true; // часть запросов не удалась, такой список нельзя кэшировать
+  return out;
 }
 
 async function tmCatalog(def, extra) {
@@ -327,7 +358,7 @@ async function tmCatalog(def, extra) {
     return cached(`tms:${def.type}:${query.toLowerCase()}:${page}`, HOUR, async () => {
       const d = await tmdb(def.path, [['query', query], ['page', page]]);
       return tmPreviews(d.results, def.type);
-    });
+    }, (v) => v.length > 0 && !v.partial);
   }
 
   const genreId = def.genres ? TM_GENRES[def.type][extra.genre] : undefined;
@@ -336,7 +367,7 @@ async function tmCatalog(def, extra) {
     if (genreId) params.push(['with_genres', genreId]);
     const d = await tmdb(def.path, params);
     return tmPreviews(d.results, def.type);
-  });
+  }, (v) => v.length > 0 && !v.partial);
 }
 
 async function tmMeta(type, imdb) {
@@ -388,7 +419,7 @@ async function tmMeta(type, imdb) {
           episode: e.episode_number,
           released: isoDate(e.air_date || d.first_air_date),
           overview: e.overview,
-          thumbnail: e.still_path ? `${IMG}/img/w300${e.still_path}` : undefined,
+          thumbnail: THUMBS && e.still_path ? `${IMG}/img/w300${e.still_path}` : undefined,
         }));
       }
     }
@@ -406,7 +437,7 @@ const activeCatalogs = () => [...(kpOn() ? KP_CATALOGS : []), ...(tmOn() ? TM_CA
 function manifest() {
   return {
     id: 'community.catalogs.kp.tmdb',
-    version: '2.0.0',
+    version: VERSION,
     name: 'Каталоги: Кинопоиск + TMDB',
     description: 'Каталоги фильмов, сериалов, аниме и мультфильмов. Работает без VPN. Только списки и описания, без потоков.',
     resources: ['catalog', 'meta'],
@@ -434,7 +465,13 @@ async function getMeta(type, imdb) {
     let meta = null;
     let firstError = null;
     if (tmOn()) {
-      try { meta = await tmMeta(type, imdb); } catch (e) { firstError = e; }
+      try {
+        // не ждём TMDB дольше 6,5 с: у приложения свой таймаут чтения
+        meta = await Promise.race([
+          tmMeta(type, imdb),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('tmdb meta timeout')), 6500)),
+        ]);
+      } catch (e) { firstError = e; }
     }
     if (!meta && TOKEN) {
       try { meta = await kpMeta(type, imdb); } catch (e) { firstError = firstError || e; }
@@ -477,10 +514,17 @@ function landing(req) {
 <p>Проверка связи: <a href="/health">/health</a></p>`;
 }
 
+async function fetchImage(size, file) {
+  const r = await fetch(`${TMDB_IMG}/${size}/${file}`, { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) return { status: r.status };
+  return { status: 200, type: r.headers.get('content-type'), buf: Buffer.from(await r.arrayBuffer()) };
+}
+
 async function proxyImage(res, size, file) {
-  const r = await fetch(`https://image.tmdb.org/t/p/${size}/${file}`, { signal: AbortSignal.timeout(15000) });
-  if (!r.ok) return send(res, 404, { err: 'no image' });
-  const buf = Buffer.from(await r.arrayBuffer());
+  const img = await imgPool(() => fetchImage(size, file));
+  if (img.status !== 200) return send(res, 404, { err: 'no image' });
+  const r = { headers: { get: () => img.type } };
+  const buf = img.buf;
   res.statusCode = 200;
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', r.headers.get('content-type') || 'image/jpeg');
@@ -496,8 +540,23 @@ async function handler(req, res) {
     if (path === '/') return send(res, 200, landing(req), 'text/html; charset=utf-8');
     if (path === '/manifest.json') return send(res, 200, manifest(), null, 'public, max-age=3600');
 
+    const deepFlag = (req.query && req.query.deep) || new URL(req.url, 'http://x').searchParams.get('deep');
+    if (path === '/deep' || path === '/health/deep' || (path === '/health' && deepFlag)) {
+      const out = { version: VERSION, region: process.env.VERCEL_REGION || null };
+      const timed = async (name, fn) => {
+        const t = Date.now();
+        try { const v = await fn(); out[name] = { ok: true, ms: Date.now() - t, ...(v || {}) }; }
+        catch (e) { out[name] = { ok: false, ms: Date.now() - t, error: e.message }; }
+      };
+      await timed('tmdbApi', () => tmdb('/configuration'));
+      await timed('tmdbMeta', async () => { const m = await tmMeta('movie', 'tt0068646'); return { name: m && m.name }; });
+      await timed('tmdbImage', async () => { const i = await fetchImage('w92', 'wwemzKWzjKYJFfCeiB57q3r4Bcm.png'); return { status: i.status }; });
+      await timed('catalogPage', async () => { const c = await tmCatalog(TM_CATALOGS[0], {}); return { items: c.length, partial: !!c.partial }; });
+      return send(res, 200, out);
+    }
+
     if (path === '/health') {
-      const out = {};
+      const out = { version: VERSION, region: process.env.VERCEL_REGION || null };
       if (TOKEN) {
         try { await kp('/movie', [['limit', 1]]); out.kinopoisk = { ok: true }; }
         catch (e) { out.kinopoisk = { ok: false, error: e.message }; }
@@ -523,7 +582,8 @@ async function handler(req, res) {
       const extra = Object.fromEntries(new URLSearchParams(m[3] || ''));
       try {
         const metas = await getCatalog(def, extra);
-        return send(res, 200, { metas }, null, CACHE_OK, origin);
+        const good = metas.length > 0 && !metas.partial;
+        return send(res, 200, { metas }, null, good ? CACHE_OK : 'no-store', origin);
       } catch (e) {
         console.error('catalog error:', e.message);
         return send(res, 200, { metas: [] });
