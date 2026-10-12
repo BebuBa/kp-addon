@@ -19,6 +19,7 @@ const TMDB_KEY = (process.env.TMDB_KEY || '').trim();
 const TMDB_API = (process.env.TMDB_API || 'https://api.themoviedb.org/3').replace(/\/$/, '');
 const TMDB_LANG = process.env.TMDB_LANG || 'ru-RU';
 
+const VERSION = '2.0.2';
 const THUMBS = process.env.TM_THUMBS === '1'; // миниатюры серий (много лишних картинок), по умолчанию выключены
 const KP_PAGE = 50;
 const TM_PAGE = 20;
@@ -434,7 +435,7 @@ const activeCatalogs = () => [...(kpOn() ? KP_CATALOGS : []), ...(tmOn() ? TM_CA
 function manifest() {
   return {
     id: 'community.catalogs.kp.tmdb',
-    version: '2.0.1',
+    version: VERSION,
     name: 'Каталоги: Кинопоиск + TMDB',
     description: 'Каталоги фильмов, сериалов, аниме и мультфильмов. Работает без VPN. Только списки и описания, без потоков.',
     resources: ['catalog', 'meta'],
@@ -537,8 +538,9 @@ async function handler(req, res) {
     if (path === '/') return send(res, 200, landing(req), 'text/html; charset=utf-8');
     if (path === '/manifest.json') return send(res, 200, manifest(), null, 'public, max-age=3600');
 
-    if (path === '/health' && new URL(req.url, 'http://x').searchParams.get('deep')) {
-      const out = {};
+    const deepFlag = (req.query && req.query.deep) || new URL(req.url, 'http://x').searchParams.get('deep');
+    if (path === '/deep' || path === '/health/deep' || (path === '/health' && deepFlag)) {
+      const out = { version: VERSION, region: process.env.VERCEL_REGION || null };
       const timed = async (name, fn) => {
         const t = Date.now();
         try { const v = await fn(); out[name] = { ok: true, ms: Date.now() - t, ...(v || {}) }; }
@@ -552,7 +554,7 @@ async function handler(req, res) {
     }
 
     if (path === '/health') {
-      const out = {};
+      const out = { version: VERSION, region: process.env.VERCEL_REGION || null };
       if (TOKEN) {
         try { await kp('/movie', [['limit', 1]]); out.kinopoisk = { ok: true }; }
         catch (e) { out.kinopoisk = { ok: false, error: e.message }; }
