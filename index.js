@@ -9,6 +9,7 @@
  *   KP_TOKEN  — ключ poiskkino.dev
  *   TMDB_KEY  — ключ TMDB (v3 api_key или длинный "Read Access Token" v4)
  *   TMDB_LANG — язык TMDB, по умолчанию ru-RU
+ *   TMDB_API / TMDB_IMG — свои адреса API и картинок TMDB (если нужно зеркало/прокси)
  *   PORT      — порт при запуске через `node index.js` (по умолчанию 7000)
  */
 const http = require('http');
@@ -18,8 +19,9 @@ const KP_API = (process.env.KP_API || 'https://api.poiskkino.dev/v1.4').replace(
 const TMDB_KEY = (process.env.TMDB_KEY || '').trim();
 const TMDB_API = (process.env.TMDB_API || 'https://api.themoviedb.org/3').replace(/\/$/, '');
 const TMDB_LANG = process.env.TMDB_LANG || 'ru-RU';
+const TMDB_IMG = (process.env.TMDB_IMG || 'https://image.tmdb.org/t/p').replace(/\/$/, '');
 
-const VERSION = '2.0.2';
+const VERSION = '2.1.0';
 const THUMBS = process.env.TM_THUMBS === '1'; // миниатюры серий (много лишних картинок), по умолчанию выключены
 const KP_PAGE = 50;
 const TM_PAGE = 20;
@@ -513,7 +515,7 @@ function landing(req) {
 }
 
 async function fetchImage(size, file) {
-  const r = await fetch(`https://image.tmdb.org/t/p/${size}/${file}`, { signal: AbortSignal.timeout(8000) });
+  const r = await fetch(`${TMDB_IMG}/${size}/${file}`, { signal: AbortSignal.timeout(8000) });
   if (!r.ok) return { status: r.status };
   return { status: 200, type: r.headers.get('content-type'), buf: Buffer.from(await r.arrayBuffer()) };
 }
